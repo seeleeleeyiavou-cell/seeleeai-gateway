@@ -1,0 +1,113 @@
+# Workflow: Deploy to IBM Cloud (Cloud Foundry or Kubernetes)
+#
+# Required repository secrets (set these in Settings -> Secrets and variables -> Actions):
+# - IBM_CLOUD_API_KEY : IBM Cloud API key with permissions to target org/space or clusters
+# - IBM_CLOUD_REGION  : IBM Cloud region (e.g. us-south)
+# For Cloud Foundry (CF) deployments:
+# - IBM_CLOUD_ORG    : Cloud Foundry org
+# - IBM_CLOUD_SPACE  : Cloud Foundry space
+# - CF_APP_NAME      : Name of the Cloud Foundry app to push
+# For Kubernetes (IBM Cloud Kubernetes Service / IKS):
+# - IKS_CLUSTER_NAME : Name or ID of the IKS cluster
+#
+# Usage:
+# - Manual: Actions -> This repository -> IBM Cloud Deploy -> Run workflow -> choose target (cf or k8s)
+# - Push: pushing to `main` will trigger CF deployment (adjust branch in `on.push` if needed)
+
+name: IBM Cloud Deploy
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Deploy target: cf (Cloud Foundry) or k8s (IKS)'
+        required: false
+        default: 'cf'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install prerequisites
+        run: |
+          set -e
+          # Install IBM Cloud CLI
+          curl -fsSL https://clis.cloud.ibm.com/install/linux | sh
+
+      - name: IBM Cloud login
+        env:
+          IBM_CLOUD_API_KEY: ${{ secrets.IBM_CLOUD_API_KEY }}
+        run: |
+          set -e
+          if [ -z "$IBM_CLOUD_API_KEY" ]; then
+            echo "Missing IBM_CLOUD_API_KEY secret" >&2
+            exit 1
+          fi
+          # Login (no region specified here; targeted in specific flows)
+          ibmcloud login --apikey "$IBM_CLOUD_API_KEY" --no-region
+
+      - name: Deploy to Cloud Foundry (CF)
+        if: "(github.event_name == 'workflow_dispatch' && (github.event.inputs.target == 'cf' || github.event.inputs.target == '')) || github.event_name == 'push'"
+        env:
+          IBM_CLOUD_REGION: ${{ secrets.IBM_CLOUD_REGION }}
+          IBM_CLOUD_ORG: ${{ secrets.IBM_CLOUD_ORG }}
+          IBM_CLOUD_SPACE: ${{ secrets.IBM_CLOUD_SPACE }}
+          CF_APP_NAME: ${{ secrets.CF_APP_NAME }}
+        run: |
+          set -e
+          if [ -z "$IBM_CLOUD_REGION" ]; then echo "Missing IBM_CLOUD_REGION secret" >&2; exit 1; fi
+          if [ -z "$IBM_CLOUD_ORG" ]; then echo "Missing IBM_CLOUD_ORG secret" >&2; exit 1; fi
+          if [ -z "$IBM_CLOUD_SPACE" ]; then echo "Missing IBM_CLOUD_SPACE secret" >&2; exit 1; fi
+          if [ -z "$CF_APP_NAME" ]; then echo "Missing CF_APP_NAME secret" >&2; exit 1; fi
+
+          ibmcloud target -r "$IBM_CLOUD_REGION"
+          # Install Cloud Foundry plugin if missing
+          if ! ibmcloud plugin list | grep -q cloud-foundry; then
+            ibmcloud plugin install cloud-foundry -f || true
+          fi
+          ibmcloud target -o "$IBM_CLOUD_ORG" -s "$IBM_CLOUD_SPACE"
+
+          # If you have a manifest.yml, use it. Otherwise `cf push` will try to push sources in repo root.
+          if [ -f manifest.yml ]; then
+            ibmcloud cf push "$CF_APP_NAME" -f manifest.yml
+          else
+            ibmcloud cf push "$CF_APP_NAME"
+          fi
+
+      - name: Deploy to IBM Kubernetes Service (IKS)
+        if: "github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'k8s'"
+        env:
+          IKS_CLUSTER_NAME: ${{ secrets.IKS_CLUSTER_NAME }}
+        run: |
+          set -e
+          if [ -z "$IKS_CLUSTER_NAME" ]; then echo "Missing IKS_CLUSTER_NAME secret" >&2; exit 1; fi
+
+          # Install kubectl (ibmcloud ks plugin provides config)
+          if ! command -v kubectl >/dev/null 2>&1; then
+            curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          fi
+
+          # Install container-service plugin if needed
+          if ! ibmcloud plugin list | grep -q 'kubernetes-service'; then
+            ibmcloud plugin install kubernetes-service -f || true
+          fi
+
+          # Configure kubectl to use the IKS cluster
+          ibmcloud ks cluster config --cluster "$IKS_CLUSTER_NAME"
+
+          # Apply manifests (assumes k8s manifests are under ./k8s directory)
+          if [ -d ./k8s ]; then
+            kubectl apply -f ./k8s
+          else
+            echo "No ./k8s directory found. Place Kubernetes manifests in ./k8s or modify this workflow." >&2
+            exit 1
+          fi
+
+      - name: Done
+        run: echo "IBM Cloud deployment workflow finished"
